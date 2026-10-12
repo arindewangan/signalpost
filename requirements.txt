@@ -1,0 +1,6 @@
+# Signalpost — pinned dependencies (Day-1).
+# stdlib-first: the agent runs on the standard library plus `requests`
+# (Brønnøysund registry client + company-website fetcher). pytest is needed
+# only to run the test suite.
+requests==2.31.0
+pytest==9.1.1
