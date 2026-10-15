@@ -37,7 +37,7 @@ from concurrent.futures import ThreadPoolExecutor
 from .agent import ResearchAgent
 from .batch import read_batch
 from .evidence import utc_now_iso
-from .report import build_report, load_snapshot, now_iso, replay
+from .report import build_report, load_snapshot, now_iso, replay, validate_run
 from .sources import BrregSource, WebsiteSource
 
 DEFAULT_WORKERS = 2
@@ -106,6 +106,25 @@ def main(argv: list[str] | None = None) -> int:
     previous = load_snapshot(args.snapshot) if args.snapshot else {}
     replay(previous, envelopes)
 
+    # Evaluation-contract gate: one terminal envelope per input; every
+    # available claim backed by auditable evidence; non-available claims carry
+    # no value. Violations are recorded loudly on the envelope and the report.
+    expected_orgs = [b.organisation_number for b in inputs]
+    violations = validate_run(envelopes, expected_orgs)
+    per_org: dict[str, list[str]] = {}
+    for envelope in envelopes:
+        org_violations = [
+            v for v in violations if v.startswith(f"{envelope.get('organisation_number')}: ")
+        ]
+        envelope["validation_violations"] = org_violations
+        per_org[envelope.get("organisation_number", "?")] = org_violations
+    run_level_violations = [
+        v for v in violations
+        if not any(v.startswith(f"{org}: ") for org in per_org)
+    ]
+    for message in run_level_violations:
+        print(f"CONTRACT VIOLATION: {message}", file=sys.stderr)
+
     profiles = [agent.build_profile(e) for e in envelopes]
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
@@ -139,7 +158,8 @@ def main(argv: list[str] | None = None) -> int:
     ) and len(envelopes) == len(inputs)
     print(
         f"run {run_id}: {len(envelopes)} envelopes -> {args.output}; "
-        f"report -> {args.report}; self-score {report['self_score']['total']}/100"
+        f"report -> {args.report}; self-score {report['self_score']['total']}/100; "
+        f"contract violations {report['validation_violations_total']}"
     )
     return 0 if complete else 1
 

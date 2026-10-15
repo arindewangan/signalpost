@@ -7,9 +7,21 @@ AMBIGUOUS — never AVAILABLE on a guess.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from .states import CompanyState
+
+
+def _spaced_org_pattern(org: str) -> re.Pattern | None:
+    """Match the 9-digit org number with optional separators between digit
+    groups — the format Norwegian sites print in footers/contact pages
+    (e.g. '923 609 016', '923.609.016', '923-609-016'). Boundaries keep it
+    exact: it only matches this org's own digits, not a longer digit run."""
+    if not org or not re.fullmatch(r"\d{9}", org):
+        return None
+    parts = [org[0:3], org[3:6], org[6:9]]
+    return re.compile(r"(?<!\d)" + r"[\s.\-/]?".join(parts) + r"(?!\d)")
 
 
 def exact_entity_match(registry_name: str | None, evidence_text: str) -> bool:
@@ -30,13 +42,17 @@ def exact_entity_match(registry_name: str | None, evidence_text: str) -> bool:
 def evidence_refs_entity(org: str, registry_name: str | None, evidence_text: str) -> bool:
     """True when the evidence text refers to THIS exact legal entity.
 
-    Passes when the evidence contains the 9-digit organisation number verbatim
-    (strongest, self-anchoring) or the exact legal name. Similar-but-different
-    names fail — they go through the AMBIGUOUS path in `classify_field`.
+    Passes when the evidence contains the 9-digit organisation number with
+    digit boundaries (verbatim, or printed with separators as Norwegian sites
+    do: "Org.nr 923 609 016") or the exact legal name. A longer digit run
+    that merely contains the org's digits is NOT a match. Similar-but-
+    different names fail — they go through the AMBIGUOUS path in
+    `classify_field`.
     """
     if not evidence_text:
         return False
-    if org and org in evidence_text:
+    pattern = _spaced_org_pattern(org or "")
+    if pattern is not None and pattern.search(evidence_text):
         return True
     return exact_entity_match(registry_name, evidence_text)
 

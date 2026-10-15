@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 
 from .agent import ResearchAgent
 from .evidence import utc_now_iso
+from .states import validate_claim
 
 # Self-score formula (conservative proxy vs the hidden checked collection):
 #   recall_proxy x 50 + precision_gate x 30 + synthesis presence x 12 + UX x 8
@@ -24,6 +25,12 @@ _PRECISION_WEIGHT = 30.0
 _SYNTHESIS_WEIGHT = 12.0
 _UX_WEIGHT = 8.0
 
+# Evidence record fields required by the output contract: every published
+# claim needs a source, a retrieval time, and an auditable content hash.
+_EVIDENCE_REQUIRED = (
+    "source_url", "source_class", "retrieved_at", "content_sha256", "claim_span",
+)
+
 _MATERIAL_AVAILABILITY = {"available", "not_available", "ambiguous", "blocked"}
 
 
@@ -31,10 +38,27 @@ def _claim_values(envelope: dict) -> dict[str, dict]:
     return {c["field"]: c for c in envelope.get("claims", [])}
 
 
+def _canon(value):
+    """Canonical form for change comparison.
+
+    Dicts are key-sorted; lists are sorted by their canonical JSON. List
+    order is NOT semantically meaningful here — the registry API may return
+    the same sub-units/roles in a different order between runs, and that
+    must not count as a material change (the contract measures false-change
+    rate). Scalar values pass through unchanged.
+    """
+    if isinstance(value, dict):
+        return {key: _canon(val) for key, val in sorted(value.items())}
+    if isinstance(value, list):
+        return sorted(
+            (_canon(item) for item in value),
+            key=lambda item: json.dumps(item, sort_keys=True, ensure_ascii=False),
+        )
+    return value
+
+
 def _values_equal(a, b) -> bool:
-    return json.dumps(a, sort_keys=True, ensure_ascii=False) == json.dumps(
-        b, sort_keys=True, ensure_ascii=False
-    )
+    return _canon(a) == _canon(b)
 
 
 def _is_material_change(old: dict, new: dict) -> bool:
@@ -216,6 +240,9 @@ def build_report(
         "requests_total": requests_total,
         "runtime_ms_total": runtime_ms_total,
         "third_party_cost_usd": round(third_party_cost_usd, 4),
+        "validation_violations_total": sum(
+            len(e.get("validation_violations", [])) for e in envelopes
+        ),
         "self_score": self_score(envelopes),
         "models": [],
         "apis": [
@@ -232,6 +259,142 @@ def build_report(
     if simulated:
         report["simulated"] = True
     return report
+
+
+# ---------------------------------------------------------------------------
+# Evaluation-contract validation gates
+# (https://builderr.ai/docs/signalpost-evaluation-harness.md — official-run
+# checks: exactly one terminal envelope per input company; no fabricated
+# financial value or material wrong-company publication; every published
+# material claim carries source + retrieval time + reporting period where
+# relevant; missing values never silently converted to zero; refresh
+# idempotent; refresh preserves prior evidence and exposes material changes.)
+# ---------------------------------------------------------------------------
+
+_TERMINAL_STATUSES = {"completed", "failed"}
+
+
+def validate_envelope(envelope: dict, expected_org: str | None = None) -> list[str]:
+    """Check one envelope dict against the output contract.
+
+    Returns a list of violation messages (empty => the envelope is valid).
+    This is the run-time gate for the contract's fabrication guardrail: an
+    `available` claim without resolvable, auditable evidence, or any claim
+    whose non-available state still carries a value, is a violation.
+
+    `expected_org`: when given, the envelope must carry exactly this org
+    number — an invalid input ("" org) still gets its failed envelope, and
+    that is the honest value to check against, not a fabricated one.
+    """
+    violations: list[str] = []
+    org = envelope.get("organisation_number", "?")
+
+    if expected_org is not None:
+        if envelope.get("organisation_number") != expected_org:
+            violations.append(
+                f"envelope org {envelope.get('organisation_number')!r} does not "
+                f"match input {expected_org!r}"
+            )
+    elif not envelope.get("organisation_number"):
+        violations.append("envelope missing organisation_number")
+
+    run = envelope.get("run") or {}
+    if run.get("terminal_status") not in _TERMINAL_STATUSES:
+        violations.append(
+            f"{org}: invalid terminal_status {run.get('terminal_status')!r}"
+        )
+    for key in ("run_id", "started_at", "completed_at"):
+        if not run.get(key):
+            violations.append(f"{org}: run block missing {key}")
+
+    claims = envelope.get("claims")
+    if not isinstance(claims, list) or not claims:
+        violations.append(f"{org}: claims is not a non-empty list")
+
+    evidence = envelope.get("evidence")
+    if not isinstance(evidence, list):
+        violations.append(f"{org}: evidence is not a list")
+        evidence = []
+    by_id: dict[str, dict] = {}
+    for record in evidence:
+        rid = record.get("id")
+        if not rid:
+            violations.append(f"{org}: evidence record missing id")
+            continue
+        if rid in by_id:
+            violations.append(f"{org}: duplicate evidence id {rid}")
+        by_id[rid] = record
+        if not ResearchAgent.evidence_hash_ok(record):
+            violations.append(
+                f"{org}: evidence {rid} missing required fields or bad sha256"
+            )
+        if not record.get("source_url") or not record.get("retrieved_at"):
+            violations.append(f"{org}: evidence {rid} missing source or date")
+
+    for claim in claims or []:
+        violations.extend(
+            f"{org}: {message}" for message in validate_claim(claim)
+        )
+        availability = claim.get("availability")
+        ids = claim.get("evidence_ids") or []
+        if availability == "available":
+            if not ids:
+                violations.append(
+                    f"{org}: available claim {claim.get('field')} has no evidence"
+                )
+            for evidence_id in ids:
+                if evidence_id not in by_id:
+                    violations.append(
+                        f"{org}: claim {claim.get('field')} references "
+                        f"unknown evidence id {evidence_id}"
+                    )
+        elif claim.get("value") is not None:
+            # Anti-fabrication gate: a non-available claim must not carry a
+            # value (missing values are never silently converted to zero).
+            violations.append(
+                f"{org}: {availability} claim {claim.get('field')} carries a value"
+            )
+
+    if not isinstance(envelope.get("changes"), list):
+        violations.append(f"{org}: changes is not a list")
+    if not isinstance(envelope.get("errors"), list):
+        violations.append(f"{org}: errors is not a list")
+    operations = envelope.get("operations") or {}
+    for key in ("requests", "runtime_ms", "third_party_cost_usd"):
+        if key not in operations:
+            violations.append(f"{org}: operations missing {key}")
+
+    return violations
+
+
+def validate_run(envelopes: list[dict], expected_inputs: list[str]) -> list[str]:
+    """Run-level gates: one envelope per input, no extras, no missing rows,
+    in input order (the run preserves input order end to end).
+
+    A missing row means the run is not scored, so any gap is a violation.
+    """
+    violations: list[str] = []
+    if len(envelopes) != len(expected_inputs):
+        violations.append(
+            f"envelope count {len(envelopes)} != input count {len(expected_inputs)}"
+        )
+    got = [e.get("organisation_number") for e in envelopes]
+    # Empty org numbers come from invalid inputs (each still gets its failed
+    # envelope); duplicates are only meaningful for real org numbers.
+    real_got = [org for org in got if org]
+    if len(real_got) != len(set(real_got)):
+        violations.append("duplicate envelopes for the same organisation number")
+    missing = [org for org in expected_inputs if org not in got]
+    if missing:
+        violations.append(f"missing envelopes for {len(missing)} input(s): {missing[:5]}")
+    extra = [org for org in got if org not in expected_inputs]
+    if extra:
+        violations.append(f"envelopes for {len(extra)} non-input org number(s): {extra[:5]}")
+    for envelope, expected_org in zip(envelopes, expected_inputs):
+        violations.extend(validate_envelope(envelope, expected_org=expected_org))
+    for envelope in envelopes[len(expected_inputs):]:
+        violations.extend(validate_envelope(envelope))
+    return violations
 
 
 def now_iso() -> str:

@@ -50,3 +50,35 @@ def missing_value_ok(state: CompanyState) -> bool:
         CompanyState.NOT_APPLICABLE,
         CompanyState.AMBIGUOUS,
     )
+
+
+# ---------------------------------------------------------------------------
+# Evaluation-contract validation gates
+# (https://builderr.ai/docs/signalpost-evaluation-harness.md — official-run
+# checks: exactly one terminal envelope per input; valid availability states;
+# every published claim backed by evidence; missing values never fabricated.)
+# ---------------------------------------------------------------------------
+
+def validate_claim(claim: dict) -> list[str]:
+    """Check one claim dict against the output contract.
+
+    Returns a list of violation messages (empty => the claim is valid).
+    """
+    violations: list[str] = []
+    field = claim.get("field", "?")
+    if not claim.get("field"):
+        violations.append("claim missing field name")
+    if claim.get("availability") not in _ALL_STATES:
+        violations.append(
+            f"claim {field}: invalid availability state {claim.get('availability')!r}"
+        )
+    confidence = claim.get("confidence")
+    if (
+        not isinstance(confidence, (int, float))
+        or isinstance(confidence, bool)
+        or not 0.0 <= float(confidence) <= 1.0
+    ):
+        violations.append(f"claim {field}: confidence {confidence!r} not in [0, 1]")
+    if not isinstance(claim.get("evidence_ids"), list):
+        violations.append(f"claim {field}: evidence_ids is not a list")
+    return violations
