@@ -23,6 +23,8 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 
+from .classifier import evidence_refs_entity
+
 BASE = "https://data.brreg.no"
 BULK_CSV_URL = f"{BASE}/enhetsregisteret/api/enheter/lastned/csv"
 
@@ -46,7 +48,31 @@ def _normalize_url(url: str) -> str:
 _CAREER_HINTS = (
     "karriere", "career", "ledige-stillinger", "ledig-stilling",
     "stillinger", "stilling", "/jobs", "/jobb", "vacancies",
+    # link-text oriented variants (matched against anchor text as well)
+    "ledige stillinger", "ledig stilling", "open positions", "open roles",
+    "work with us", "bli en av oss",
 )
+
+# Href fragments that hint at company identity pages (contact/about), which
+# Norwegian companies use to print their org number ("Org.nr 923 609 016").
+_IDENTITY_HINTS = (
+    "kontakt", "contact", "om-oss", "about", "om-selskapet",
+    "selskapsinformasjon", "impressum",
+)
+
+# Anchor regex: captures href + visible link text.
+_ANCHOR_RE = re.compile(
+    r'<a\b[^>]*\bhref\s*=\s*["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Generic link texts that are never job titles.
+_GENERIC_LINK_WORDS = frozenset({
+    "les mer", "read more", "kontakt", "contact", "personvern", "privacy",
+    "cookies", "cookie", "om oss", "about us", "hjem", "home", "søk",
+    "search", "meny", "menu", "logg inn", "log in", "tilbake", "back",
+    "forside", "personvernerklæring",
+})
 
 # Tiny built-in fixture for the offline dry run. Simulated data, clearly labeled.
 _FIXTURE: dict[str, dict[str, Any]] = {
@@ -355,6 +381,7 @@ class WebsiteSource:
         self.session.headers["User-Agent"] = "signalpost/0.1.0 (company-research-agent)"
         self.requests_made = 0
         self._thread_counts = threading.local()
+        self._robots_cache: dict[str, bool] = {}
 
     def _count_request(self) -> None:
         self.requests_made += 1
@@ -365,13 +392,22 @@ class WebsiteSource:
         return getattr(self._thread_counts, "n", 0)
 
     def _robots_disallows(self, url: str) -> bool:
+        """Per-host robots.txt verdict, cached: a blanket Disallow for our
+        user-agent blocks the crawl. Unreachable robots.txt is not a refusal."""
+        parsed = urlparse(url)
+        host = f"{parsed.scheme}://{parsed.netloc}"
+        if host not in self._robots_cache:
+            self._robots_cache[host] = self._check_robots(url)
+        return self._robots_cache[host]
+
+    def _check_robots(self, url: str) -> bool:
         parsed = urlparse(url)
         robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
         try:
             resp = self.session.get(robots_url, timeout=self.timeout)
             self._count_request()
         except requests.RequestException:
-            return False  # unreachable robots.txt is not a refusal
+            return False
         if resp.status_code != 200:
             return False
         in_our_block = False
@@ -388,23 +424,55 @@ class WebsiteSource:
                     saw_disallow_all = saw_disallow_all or val == "/"
         return saw_disallow_all
 
+    @staticmethod
+    def _anchor_text(inner_html: str) -> str:
+        return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", inner_html)).strip()
+
+    def _same_host_links(self, html: str, base_url: str,
+                         hints: tuple[str, ...], cap: int) -> list[str]:
+        """Same-host links whose href OR visible link text hints at the target
+        section. Only links actually present on the company-owned page are ever
+        followed — no guessed paths."""
+        links: list[str] = []
+        base_host = urlparse(base_url).netloc
+        for match in _ANCHOR_RE.finditer(html):
+            href = match.group(1).strip()
+            if not href or href.startswith("#"):
+                continue
+            if href.lower().startswith(("javascript:", "mailto:", "tel:")):
+                continue
+            blob = f"{href} {self._anchor_text(match.group(2))}".lower()
+            if any(hint in blob for hint in hints):
+                full = urljoin(base_url, href)
+                if urlparse(full).netloc == base_host and full not in links:
+                    links.append(full)
+                    if len(links) >= cap:
+                        break
+        return links
+
     def fetch(self, url: str, org: str, legal_name: str) -> tuple[str, str]:
         """Fetch the company homepage; return (outcome, page-text-or-note).
 
         The page text is returned ONLY when it references the exact org number
-        or the exact legal name; otherwise the outcome is no_reference and the
-        text is dropped (nothing publishable).
+        or the exact legal name. When the homepage itself carries no entity
+        reference, up to 2 same-host identity links (kontakt/om-oss style
+        pages, discovered from the homepage's own links) are checked — still
+        company-owned, robots-respecting, and gated on the exact entity.
+        Anything else => no_reference, which the agent maps to AMBIGUOUS,
+        never AVAILABLE.
         """
         url = _normalize_url(url)
         outcome, payload = self._fetch_html(url)
         if outcome != _HTML_OK:
             return outcome, payload
-        text = payload
-        hay = text.upper()
-        org_hit = org in text  # 9-digit org number, verbatim
-        name_hit = bool(legal_name) and legal_name.strip().upper() in hay
-        if org_hit or name_hit:
-            return WebsiteOutcome.MATCHED, text
+        if evidence_refs_entity(org, legal_name, payload):
+            return WebsiteOutcome.MATCHED, payload
+        for link in self.find_identity_links(payload, url):
+            page_outcome, page_payload = self._fetch_html(link)
+            if page_outcome != _HTML_OK:
+                continue
+            if evidence_refs_entity(org, legal_name, page_payload):
+                return WebsiteOutcome.MATCHED, page_payload
         return WebsiteOutcome.FETCHED_NO_REFERENCE, "page does not reference the organisation"
 
     # ------------------------------------------------------------------
@@ -414,27 +482,53 @@ class WebsiteSource:
     # Anything else => ambiguous, never available.
     # ------------------------------------------------------------------
     def find_careers_links(self, html: str, base_url: str) -> list[str]:
-        """Same-host links whose href hints at a careers/jobs section."""
-        links: list[str] = []
-        for match in re.finditer(r'href\s*=\s*["\']([^"\'#]+)["\']', html, re.IGNORECASE):
-            href = match.group(1).strip()
-            if any(hint in href.lower() for hint in _CAREER_HINTS):
-                full = urljoin(base_url, href)
-                if urlparse(full).netloc == urlparse(base_url).netloc and full not in links:
-                    links.append(full)
-        return links[:2]
+        """Same-host links whose href or visible text hints at a careers/jobs
+        section (e.g. <a href="/om-oss">Karriere</a>)."""
+        return self._same_host_links(html, base_url, _CAREER_HINTS, cap=2)
+
+    def find_identity_links(self, html: str, base_url: str) -> list[str]:
+        """Same-host links whose href or visible text hints at a company
+        identity page (kontakt / om-oss / about)."""
+        return self._same_host_links(html, base_url, _IDENTITY_HINTS, cap=2)
 
     @staticmethod
-    def extract_job_titles(html: str, cap: int = 25) -> list[str]:
-        """Best-effort job titles from a static careers page: <title>, <h1>, <h2>."""
-        titles: list[str] = []
+    def extract_job_links(html: str, cap: int = 25) -> list[tuple[str, str]]:
+        """(title, href) pairs from a careers page: headings plus visible
+        anchor texts (postings are usually links), skipping generic nav words.
+        HTML entities are decoded."""
+        import html as _html
+
+        def _clean(inner: str) -> str:
+            return _html.unescape(
+                re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", inner)).strip()
+            )
+
+        pairs: list[tuple[str, str]] = []
+
+        def _add(title: str, href: str) -> None:
+            if title and len(title) < 200 and (title, href) not in pairs:
+                pairs.append((title, href))
+
         for tag in ("h1", "h2", "title"):
             for match in re.finditer(rf"<{tag}[^>]*>(.*?)</{tag}>", html,
                                      re.IGNORECASE | re.DOTALL):
-                text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", match.group(1))).strip()
-                if text and len(text) < 200 and text not in titles:
-                    titles.append(text)
-        return titles[:cap]
+                _add(_clean(match.group(1)), "")
+        for match in _ANCHOR_RE.finditer(html):
+            href = match.group(1).strip()
+            text = _clean(match.group(2))
+            lowered = text.lower()
+            if (text and len(text) < 200
+                    and lowered not in _GENERIC_LINK_WORDS
+                    and not lowered.startswith(("http", "www."))):
+                _add(text, href)
+        return pairs[:cap]
+
+    @staticmethod
+    def extract_job_titles(html: str, cap: int = 25) -> list[str]:
+        """Best-effort job titles from a static careers page: <title>, <h1>,
+        <h2>, plus visible anchor texts (job postings are usually links),
+        skipping generic navigation words."""
+        return [title for title, _ in WebsiteSource.extract_job_links(html, cap)]
 
     def fetch_careers(self, homepage_url: str, org: str, legal_name: str) -> tuple[str, Any]:
         """Discover open positions on the company-owned careers pages.
@@ -467,18 +561,23 @@ class WebsiteSource:
         if not texts:
             return WebsiteOutcome.FAILED, "careers pages could not be fetched"
         combined = "\n".join(texts)
-        hay = combined.upper()
-        anchored = (bool(org) and org in combined) or (
-            bool(legal_name) and legal_name.strip().upper() in hay
-        )
-        if not anchored:
+        # Exact-entity gate (shared with classifier): org number verbatim or
+        # with separators, or the exact legal name. Uncertain match is handled
+        # by the agent as AMBIGUOUS, never AVAILABLE.
+        if not evidence_refs_entity(org, legal_name, combined):
             return (WebsiteOutcome.FETCHED_NO_REFERENCE,
                     "careers page does not reference the organisation")
-        jobs: list[str] = []
+        # Prefer anchors that look like job postings (their href hints at a
+        # careers/stilling page); page headers and nav links are not postings.
+        # Fall back to all harvested titles when no posting-like link exists.
+        pairs: list[tuple[str, str]] = []
         for text in texts:
-            for title in self.extract_job_titles(text):
-                if title not in jobs:
-                    jobs.append(title)
+            pairs.extend(self.extract_job_links(text))
+        preferred = [
+            title for title, href in pairs
+            if href and any(hint in href.lower() for hint in _CAREER_HINTS)
+        ]
+        jobs = preferred or [title for title, _ in pairs]
         return WebsiteOutcome.MATCHED, {
             "jobs": jobs[:25], "source_page": first_page,
             "page_text": texts[0][:20000],
