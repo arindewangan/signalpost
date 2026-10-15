@@ -66,6 +66,22 @@ def test_evidence_merge_no_duplicates():
         assert len(envelope["evidence"]) >= before[org]
 
 
+def test_list_reordering_is_not_a_material_change():
+    """The registry API may return the same sub-units/roles in a different
+    order between runs — that is not a material change (false-change rate).
+    Regression test for the Day-3 live replay finding (934930150)."""
+    first = _run()
+    second = _run()
+    for envelope in second:
+        for claim in envelope["claims"]:
+            if isinstance(claim.get("value"), list):
+                claim["value"] = list(reversed(claim["value"]))
+    previous = _snapshot(first)
+    changes = compute_changes(previous, _snapshot(second))
+    for org, org_changes in changes.items():
+        assert org_changes == [], (org, org_changes)
+
+
 def test_load_snapshot_roundtrip(tmp_path):
     envelopes = _run()
     path = tmp_path / "prev.jsonl"
