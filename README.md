@@ -74,10 +74,10 @@ printf '%s\n' '{"organisation_number": "917755736"}' '"999999999"' '"bad"' > /tm
 .venv/bin/python -m pytest tests/ -q
 ```
 
-Expect exit 0, 3 envelopes (completed/completed/failed), and 43/43 tests
-passing. The dry-run self-score on fixture data (~66/100) is a plumbing check
-only — it is NOT the qualification estimate; that needs the real 100-company
-run (Day-2 work).
+Expect exit 0, 3 envelopes (completed/completed/failed), 0 contract violations,
+and 87/87 tests passing. The dry-run self-score on fixture data (~58/100) is
+a plumbing check only — it is NOT the qualification estimate; that needs the
+real 100-company run (Day-2 work).
 
 ## HTML profile report (UX)
 
